@@ -31,7 +31,16 @@ jobs:
           pip install buildozer "cython<3" virtualenv
 
       - name: Build APK
-        run: buildozer -v android debug
+        shell: bash
+        run: buildozer -v android debug 2>&1 | tee build.log
+
+      - name: Show errors
+        if: failure()
+        run: |
+          echo "=== Lines with errors ==="
+          grep -n -i -E "error|failed|Traceback" build.log | grep -v -i "warning" | tail -n 40
+          echo "=== Last 60 lines ==="
+          tail -n 60 build.log
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
