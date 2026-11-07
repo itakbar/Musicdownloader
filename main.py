@@ -1,4 +1,5 @@
 import os
+import shutil
 import sys
 import threading
 import traceback
@@ -102,6 +103,82 @@ def scan_media(path):
         print("Скан медиа не удался:", ex)
 
 
+def temp_folder():
+    """Личная папка приложения: сюда можно писать без ограничений Android."""
+    base = os.path.expanduser("~")
+    if platform == "android":
+        try:
+            from android.storage import app_storage_path
+            base = app_storage_path()
+        except Exception:
+            base = os.getcwd()
+    path = os.path.join(base, "downloads_tmp")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def guess_mime(path, mode):
+    ext = os.path.splitext(path)[1].lower()
+    if mode == "a":
+        return {".m4a": "audio/mp4", ".mp3": "audio/mpeg", ".webm": "audio/webm",
+                ".opus": "audio/ogg", ".ogg": "audio/ogg"}.get(ext, "audio/mp4")
+    return {".mp4": "video/mp4", ".webm": "video/webm",
+            ".mkv": "video/x-matroska"}.get(ext, "video/mp4")
+
+
+def save_to_shared(path, mode):
+    """Переносит готовый файл в Music/MusicDownloader (аудио) или
+    Movies/MusicDownloader (видео) через медиатеку Android.
+    Возвращает путь для показа на экране."""
+    from jnius import autoclass
+
+    name = os.path.basename(path)
+    sub = "Music" if mode == "a" else "Movies"
+    sdk = autoclass("android.os.Build$VERSION").SDK_INT
+
+    if sdk < 29:  # старый Android: обычное копирование
+        folder = os.path.join(storage_root(), sub, "MusicDownloader")
+        os.makedirs(folder, exist_ok=True)
+        dest = os.path.join(folder, name)
+        shutil.copyfile(path, dest)
+        scan_media(dest)
+        return dest
+
+    PythonActivity = autoclass("org.kivy.android.PythonActivity")
+    ContentValues = autoclass("android.content.ContentValues")
+    if mode == "a":
+        collection = autoclass("android.provider.MediaStore$Audio$Media").EXTERNAL_CONTENT_URI
+    else:
+        collection = autoclass("android.provider.MediaStore$Video$Media").EXTERNAL_CONTENT_URI
+
+    resolver = PythonActivity.mActivity.getContentResolver()
+    values = ContentValues()
+    values.put("_display_name", name)
+    values.put("mime_type", guess_mime(path, mode))
+    values.put("relative_path", f"{sub}/MusicDownloader")
+    uri = resolver.insert(collection, values)
+    if uri is None:
+        raise RuntimeError("не удалось создать файл в медиатеке")
+
+    out = resolver.openOutputStream(uri)
+    inp = autoclass("java.io.FileInputStream")(path)
+    try:
+        try:
+            autoclass("android.os.FileUtils").copy(inp, out)
+        except Exception:
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(262144)
+                    if not chunk:
+                        break
+                    out.write(chunk, 0, len(chunk))
+    finally:
+        inp.close()
+        out.flush()
+        out.close()
+    return f"{sub}/MusicDownloader/{name}"
+
+
 # ---------- YouTube ----------
 
 class QuietLogger:
@@ -171,6 +248,10 @@ def search(query, limit=SEARCH_LIMIT):
     return results
 
 
+# Если YouTube не отдаёт формат, пробуем другие "клиенты" по очереди.
+CLIENT_TRIES = [None, ["android_vr"], ["tv"], ["web_safari"]]
+
+
 def download(url, mode, folder, on_progress):
     """mode: 'a' = аудио (m4a), 'v' = видео (mp4). Возвращает путь к файлу."""
 
@@ -180,18 +261,29 @@ def download(url, mode, folder, on_progress):
             if total:
                 on_progress(d.get("downloaded_bytes", 0) * 100 / total)
 
-    opts = base_opts()
-    opts.update({
-        "outtmpl": os.path.join(folder, "%(title)s.%(ext)s"),
-        "noplaylist": True,
-        "progress_hooks": [hook],
-        "format": "bestaudio[ext=m4a]/bestaudio" if mode == "a" else "best[ext=mp4]/best",
-    })
-    with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        downloads = info.get("requested_downloads") or []
-        path = downloads[0].get("filepath") if downloads else None
-        return path or ydl.prepare_filename(info)
+    fmt = "bestaudio[ext=m4a]/bestaudio" if mode == "a" else "best[ext=mp4]/best"
+    last_ex = None
+    for clients in CLIENT_TRIES:
+        opts = base_opts()
+        opts.update({
+            "outtmpl": os.path.join(folder, "%(title)s.%(ext)s"),
+            "noplaylist": True,
+            "progress_hooks": [hook],
+            "format": fmt,
+        })
+        if clients:
+            opts["extractor_args"] = {"youtube": {"player_client": clients}}
+        try:
+            with YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                downloads = info.get("requested_downloads") or []
+                path = downloads[0].get("filepath") if downloads else None
+                return path or ydl.prepare_filename(info)
+        except Exception as ex:
+            last_ex = ex
+            if "format is not available" not in str(ex):
+                raise
+    raise last_ex
 
 
 def short_error(ex):
@@ -400,13 +492,26 @@ class MusicApp(App):
 
     def _download_worker(self, url, mode):
         try:
-            folder = get_folder(mode)
+            on_android = platform == "android"
+            folder = temp_folder() if on_android else get_folder(mode)
             path = download(url, mode, folder, self._on_progress)
-            scan_media(path)
+            if on_android:
+                self.set_status("Сохраняю в память телефона...")
+                shown = save_to_shared(path, mode)
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+            else:
+                shown = path
             self.set_progress(100)
-            self.set_status(f"Готово!\n{path}")
+            self.set_status(f"Готово!\n{shown}")
         except Exception as ex:
-            self.set_status(f"Ошибка скачивания: {short_error(ex)}")
+            if "format is not available" in str(ex):
+                self.set_status("YouTube не отдаёт нужный формат для этого "
+                                "видео. Попробуй «Аудио» или другой результат.")
+            else:
+                self.set_status(f"Ошибка скачивания: {short_error(ex)}")
         finally:
             self.busy = False
 
