@@ -9,7 +9,9 @@ source.exclude_dirs = .github,bin,.buildozer
 
 version = 0.1
 
-requirements = python3,kivy==2.3.0,openssl,certifi,yt-dlp,pyjnius,android
+requirements = hostpython3==3.11.5,python3==3.11.5,kivy==2.3.0,openssl,certifi,yt-dlp,pyjnius,android
+
+p4a.branch = v2024.01.21
 
 orientation = portrait
 fullscreen = 0
